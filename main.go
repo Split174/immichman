@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,43 @@ import (
 	"github.com/PaulSonOfLars/gotgbot/v2/ext/handlers"
 	"github.com/PaulSonOfLars/gotgbot/v2/ext/handlers/filters/message"
 )
+
+// --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
+var (
+	immichClient *ImmichClient
+	// Map для быстрого поиска ID админов: map[UserID]exists
+	adminIDs = make(map[int64]bool)
+)
+
+// --- КЭШ АВТОРИЗОВАННЫХ ЧАТОВ ---
+// Чтобы не проверять присутствие админа в чате при каждом фото
+type AuthCacheStruct struct {
+	sync.RWMutex
+	// map[ChatID]ExpiryTime
+	authorizedChats map[int64]time.Time
+}
+
+var authCache = AuthCacheStruct{
+	authorizedChats: make(map[int64]time.Time),
+}
+
+// Check возвращает true, если чат валиден и срок проверки не истек
+func (ac *AuthCacheStruct) Check(chatID int64) bool {
+	ac.RLock()
+	defer ac.RUnlock()
+	expiry, exists := ac.authorizedChats[chatID]
+	if !exists {
+		return false
+	}
+	return time.Now().Before(expiry)
+}
+
+// Add добавляет чат в "белый список" на 1 час
+func (ac *AuthCacheStruct) Add(chatID int64) {
+	ac.Lock()
+	defer ac.Unlock()
+	ac.authorizedChats[chatID] = time.Now().Add(1 * time.Hour)
+}
 
 // --- КЭШ ДЛЯ АЛЬБОМОВ TELEGRAM ---
 
@@ -49,10 +87,9 @@ func (c *GroupCacheStruct) Get(groupID string) (string, bool) {
 }
 
 // --- MAIN ---
-var immichClient *ImmichClient
 
 func main() {
-	// Загрузка конфигурации
+	// 1. Загрузка конфигурации
 	token := os.Getenv("TELEGRAM_TOKEN")
 	if token == "" {
 		log.Fatal("TELEGRAM_TOKEN не установлен")
@@ -66,7 +103,14 @@ func main() {
 		log.Fatal("IMMICH_API_KEY не установлен")
 	}
 
-	// Инициализация клиента Immich
+	// 2. Парсинг админов
+	adminsEnv := os.Getenv("TELEGRAM_ADMINS")
+	if adminsEnv == "" {
+		log.Fatal("TELEGRAM_ADMINS не установлен (укажите ID через запятую)")
+	}
+	loadAdmins(adminsEnv)
+
+	// 3. Инициализация клиента Immich
 	immichClient = NewImmichClient(strings.TrimRight(immichURL, "/"), immichAPIKey)
 
 	if err := immichClient.Ping(); err != nil {
@@ -83,7 +127,7 @@ func main() {
 			log.Println("Ошибка обработчика:", err)
 			return ext.DispatcherActionNoop
 		},
-		MaxRoutines: 20, // Можно увеличить количество горутин для параллельной обработки
+		MaxRoutines: 20,
 	})
 	updater := ext.NewUpdater(dispatcher, nil)
 
@@ -105,13 +149,43 @@ func main() {
 		log.Fatal("Ошибка запуска: " + err.Error())
 	}
 
-	log.Printf("Бот %s запущен. Выгрузка в Immich. Логика: папка чата -> !папка. ОК.\n", b.User.Username)
+	log.Printf("Бот %s запущен в режиме ограниченного доступа. AdminIDs: %d", b.User.Username, len(adminIDs))
 	updater.Idle()
+}
+
+func loadAdmins(env string) {
+	parts := strings.Split(env, ",")
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(trimmed, 10, 64)
+		if err != nil {
+			log.Printf("WARN: Некорректный ID админа: %s", p)
+			continue
+		}
+		adminIDs[id] = true
+	}
+	if len(adminIDs) == 0 {
+		log.Fatal("Не найдено ни одного корректного ID в TELEGRAM_ADMINS")
+	}
 }
 
 // handleMedia разбирает сообщение и запускает выгрузку в Immich
 func handleMedia(b *gotgbot.Bot, ctx *ext.Context) error {
 	msg := ctx.EffectiveMessage
+	chat := ctx.EffectiveChat
+	user := ctx.EffectiveSender.User
+
+	// --- 1. ПРОВЕРКА ПРАВ ДОСТУПА ---
+	if !checkPermission(b, chat, user) {
+		// Для дебага можно раскомментировать, но в продакшене будет спамить
+		// log.Printf("Игнор: чат %s (%d), юзер %s (%d)", chat.Title, chat.Id, user.FirstName, user.Id)
+		return nil
+	}
+	// --------------------------------
+
 	var fileID, fileName string
 	var fileDate = time.Unix(msg.Date, 0)
 
@@ -138,11 +212,50 @@ func handleMedia(b *gotgbot.Bot, ctx *ext.Context) error {
 	return uploadToImmich(b, ctx, fileID, fileName, albumName, fileDate)
 }
 
+// checkPermission решает, обрабатывать ли файлы из этого чата
+func checkPermission(b *gotgbot.Bot, chat *gotgbot.Chat, user *gotgbot.User) bool {
+	// 1. Если это личка — проверяем, админ ли пишет
+	if chat.Type == "private" {
+		return adminIDs[user.Id]
+	}
+
+	// 2. Если пишет сам админ в любой группе — разрешаем и запоминаем группу
+	// (Это экономит API вызовы)
+	if adminIDs[user.Id] {
+		authCache.Add(chat.Id)
+		return true
+	}
+
+	// 3. Проверяем кэш авторизованных групп
+	if authCache.Check(chat.Id) {
+		return true
+	}
+
+	// 4. Тяжелая проверка: перебираем всех админов из конфига и спрашиваем Telegram,
+	// состоят ли они в этом чате.
+	for adminID := range adminIDs {
+		member, err := b.GetChatMember(chat.Id, adminID, nil)
+		if err != nil {
+			// Ошибка запроса (например, бот кикнут или нет прав видеть админов)
+			continue
+		}
+
+		status := member.GetStatus()
+		// Статусы: creator, administrator, member - считаем, что админ "присутствует"
+		if status == "creator" || status == "administrator" || status == "member" {
+			log.Printf("Чат '%s' (%d) авторизован по присутствию админа %d", chat.Title, chat.Id, adminID)
+			authCache.Add(chat.Id)
+			return true
+		}
+	}
+
+	return false
+}
+
 // resolveTargetAlbumName определяет имя альбома для Immich
 func resolveTargetAlbumName(ctx *ext.Context, groupID, caption string) string {
 	const trigger = "!папка"
 
-	// Вспомогательная функция для получения имени альбома по умолчанию (Название чата)
 	getDefaultChatAlbum := func() string {
 		chat := ctx.EffectiveChat
 		rawName := chat.Title
@@ -155,11 +268,9 @@ func resolveTargetAlbumName(ctx *ext.Context, groupID, caption string) string {
 		if rawName == "" {
 			rawName = fmt.Sprintf("Chat_%d", chat.Id)
 		}
-		// Immich сам обработает любые символы, нет нужды в sanitize
 		return rawName
 	}
 
-	// 1. Сценарий: Явное указание папки (альбома) в текущем сообщении
 	folderName := parseFolderFromCaption(caption, trigger)
 	if folderName != "" {
 		if groupID != "" {
@@ -168,12 +279,10 @@ func resolveTargetAlbumName(ctx *ext.Context, groupID, caption string) string {
 		return folderName
 	}
 
-	// 2. Сценарий: Это альбом Telegram, ищем в кеше
 	if groupID != "" {
 		if cachedAlbum, found := groupCache.Get(groupID); found {
 			return cachedAlbum
 		}
-		// Ждем, если сообщения пришли асинхронно
 		for i := 0; i < 5; i++ {
 			time.Sleep(200 * time.Millisecond)
 			if cachedAlbum, found := groupCache.Get(groupID); found {
@@ -182,7 +291,6 @@ func resolveTargetAlbumName(ctx *ext.Context, groupID, caption string) string {
 		}
 	}
 
-	// 3. Сценарий: Используем имя чата
 	return getDefaultChatAlbum()
 }
 
@@ -205,20 +313,17 @@ func parseFolderFromCaption(caption, trigger string) string {
 func uploadToImmich(b *gotgbot.Bot, ctx *ext.Context, fileID, customName, albumName string, fileDate time.Time) error {
 	log.Printf("Обработка: %s (Альбом: %s)", fileID, albumName)
 
-	// 1. ID альбома
 	albumID, err := immichClient.GetOrCreateAlbum(albumName)
 	if err != nil {
 		log.Printf("ОШИБКА с альбомом: %v", err)
-		return err // Прерываем, если не можем найти альбом
+		return err
 	}
 
-	// 2. Инфо о файле Telegram
 	tgFile, err := b.GetFile(fileID, nil)
 	if err != nil {
 		return err
 	}
 
-	// 3. Скачивание стримом
 	dlURL := tgFile.URL(b, &gotgbot.RequestOpts{Timeout: 60 * time.Second})
 	resp, err := http.Get(dlURL)
 	if err != nil {
@@ -237,24 +342,17 @@ func uploadToImmich(b *gotgbot.Bot, ctx *ext.Context, fileID, customName, albumN
 		finalName = filepath.Base(tgFile.FilePath)
 	}
 
-	// Уникальный ID для дедупликации Immich
 	deviceAssetID := fmt.Sprintf("tg-%d-%d", ctx.EffectiveChat.Id, ctx.EffectiveMessage.MessageId)
 
-	// 4. ЗАГРУЗКА ФАЙЛА В IMMICH
-	// Обратите внимание: мы убрали albumID из этого вызова
 	uploadResult, err := immichClient.UploadAsset(finalName, resp.Body, fileDate, deviceAssetID)
 	if err != nil {
 		log.Printf("ОШИБКА UploadAsset: %v", err)
 		return err
 	}
 
-	// Если это дубликат и ID не вернулся, мы не сможем добавить его в альбом.
-	// Обычно Immich возвращает ID даже для дубликатов, если включена соответствующая опция,
-	// но если ID пустой - выходим.
 	if uploadResult.ID == "" {
 		if uploadResult.Duplicate {
-			log.Printf("Файл '%s' уже существует (дубликат). ID не получен, пропускаем добавление в альбом.", finalName)
-			// Ставим реакцию "глаза", типа "вижу, но уже было"
+			log.Printf("Файл '%s' уже существует (дубликат).", finalName)
 			_, _ = b.SetMessageReaction(ctx.EffectiveChat.Id, ctx.EffectiveMessage.MessageId, &gotgbot.SetMessageReactionOpts{
 				Reaction: []gotgbot.ReactionType{gotgbot.ReactionTypeEmoji{Emoji: "👀"}},
 			})
@@ -263,11 +361,9 @@ func uploadToImmich(b *gotgbot.Bot, ctx *ext.Context, fileID, customName, albumN
 		return fmt.Errorf("файл загружен, но ID не получен")
 	}
 
-	// 5. ЯВНОЕ ДОБАВЛЕНИЕ В АЛЬБОМ
 	err = immichClient.AddAssetToAlbum(albumID, uploadResult.ID)
 	if err != nil {
 		log.Printf("Загружен, но не добавлен в альбом: %v", err)
-		// Не "фэйлим" всю функцию, так как файл все-таки сохранился
 	}
 
 	_, _ = b.SetMessageReaction(ctx.EffectiveChat.Id, ctx.EffectiveMessage.MessageId, &gotgbot.SetMessageReactionOpts{
