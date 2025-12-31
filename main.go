@@ -137,7 +137,7 @@ func main() {
 	dispatcher.AddHandler(handlers.NewMessage(message.Document, handleMedia))
 
 	err = updater.StartPolling(b, &ext.PollingOpts{
-		DropPendingUpdates: true,
+		DropPendingUpdates: false,
 		GetUpdatesOpts: &gotgbot.GetUpdatesOpts{
 			Timeout: 9,
 			RequestOpts: &gotgbot.RequestOpts{
