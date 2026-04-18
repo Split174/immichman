@@ -139,9 +139,9 @@ func main() {
 	err = updater.StartPolling(b, &ext.PollingOpts{
 		DropPendingUpdates: false,
 		GetUpdatesOpts: &gotgbot.GetUpdatesOpts{
-			Timeout: 9,
+			Timeout: 60,
 			RequestOpts: &gotgbot.RequestOpts{
-				Timeout: time.Second * 10,
+				Timeout: time.Second * 90,
 			},
 		},
 	})
@@ -180,8 +180,6 @@ func handleMedia(b *gotgbot.Bot, ctx *ext.Context) error {
 
 	// --- 1. ПРОВЕРКА ПРАВ ДОСТУПА ---
 	if !checkPermission(b, chat, user) {
-		// Для дебага можно раскомментировать, но в продакшене будет спамить
-		// log.Printf("Игнор: чат %s (%d), юзер %s (%d)", chat.Title, chat.Id, user.FirstName, user.Id)
 		return nil
 	}
 	// --------------------------------
@@ -214,34 +212,28 @@ func handleMedia(b *gotgbot.Bot, ctx *ext.Context) error {
 
 // checkPermission решает, обрабатывать ли файлы из этого чата
 func checkPermission(b *gotgbot.Bot, chat *gotgbot.Chat, user *gotgbot.User) bool {
-	// 1. Если это личка — проверяем, админ ли пишет
 	if chat.Type == "private" {
 		return adminIDs[user.Id]
 	}
 
-	// 2. Если пишет сам админ в любой группе — разрешаем и запоминаем группу
-	// (Это экономит API вызовы)
 	if adminIDs[user.Id] {
 		authCache.Add(chat.Id)
 		return true
 	}
 
-	// 3. Проверяем кэш авторизованных групп
 	if authCache.Check(chat.Id) {
 		return true
 	}
 
-	// 4. Тяжелая проверка: перебираем всех админов из конфига и спрашиваем Telegram,
-	// состоят ли они в этом чате.
 	for adminID := range adminIDs {
-		member, err := b.GetChatMember(chat.Id, adminID, nil)
+		member, err := b.GetChatMember(chat.Id, adminID, &gotgbot.GetChatMemberOpts{
+			RequestOpts: &gotgbot.RequestOpts{Timeout: 10 * time.Second},
+		})
 		if err != nil {
-			// Ошибка запроса (например, бот кикнут или нет прав видеть админов)
 			continue
 		}
 
 		status := member.GetStatus()
-		// Статусы: creator, administrator, member - считаем, что админ "присутствует"
 		if status == "creator" || status == "administrator" || status == "member" {
 			log.Printf("Чат '%s' (%d) авторизован по присутствию админа %d", chat.Title, chat.Id, adminID)
 			authCache.Add(chat.Id)
@@ -319,14 +311,26 @@ func uploadToImmich(b *gotgbot.Bot, ctx *ext.Context, fileID, customName, albumN
 		return err
 	}
 
-	tgFile, err := b.GetFile(fileID, nil)
+	// ИЗМЕНЕНО: Добавляем тайм-аут на получение информации о файле
+	tgFile, err := b.GetFile(fileID, &gotgbot.GetFileOpts{
+		RequestOpts: &gotgbot.RequestOpts{Timeout: 15 * time.Second},
+	})
 	if err != nil {
+		log.Printf("ОШИБКА GetFile у TG: %v", err)
 		return err
 	}
 
 	dlURL := tgFile.URL(b, &gotgbot.RequestOpts{Timeout: 60 * time.Second})
-	resp, err := http.Get(dlURL)
+
+	// ИЗМЕНЕНО: Использование клиента с жестким тайм-аутом вместо зависающего http.Get
+	// 5 минут на скачивание файла из TG - должно хватить даже в плохой сети для видео.
+	tgClient := &http.Client{
+		Timeout: 5 * time.Minute,
+	}
+
+	resp, err := tgClient.Get(dlURL)
 	if err != nil {
+		log.Printf("ОШИБКА загрузки фала из TG: %v", err)
 		return err
 	}
 	defer resp.Body.Close()
@@ -346,7 +350,7 @@ func uploadToImmich(b *gotgbot.Bot, ctx *ext.Context, fileID, customName, albumN
 
 	uploadResult, err := immichClient.UploadAsset(finalName, resp.Body, fileDate, deviceAssetID)
 	if err != nil {
-		log.Printf("ОШИБКА UploadAsset: %v", err)
+		log.Printf("ОШИБКА UploadAsset (файл %s): %v", finalName, err)
 		return err
 	}
 
@@ -354,7 +358,8 @@ func uploadToImmich(b *gotgbot.Bot, ctx *ext.Context, fileID, customName, albumN
 		if uploadResult.Duplicate {
 			log.Printf("Файл '%s' уже существует (дубликат).", finalName)
 			_, _ = b.SetMessageReaction(ctx.EffectiveChat.Id, ctx.EffectiveMessage.MessageId, &gotgbot.SetMessageReactionOpts{
-				Reaction: []gotgbot.ReactionType{gotgbot.ReactionTypeEmoji{Emoji: "👀"}},
+				Reaction:    []gotgbot.ReactionType{gotgbot.ReactionTypeEmoji{Emoji: "👀"}},
+				RequestOpts: &gotgbot.RequestOpts{Timeout: 10 * time.Second}, // Добавили тайм-аут
 			})
 			return nil
 		}
@@ -370,6 +375,7 @@ func uploadToImmich(b *gotgbot.Bot, ctx *ext.Context, fileID, customName, albumN
 		Reaction: []gotgbot.ReactionType{
 			gotgbot.ReactionTypeEmoji{Emoji: "👌"},
 		},
+		RequestOpts: &gotgbot.RequestOpts{Timeout: 10 * time.Second},
 	})
 
 	log.Printf("ОК: %s -> Альбом %s", finalName, albumName)

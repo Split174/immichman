@@ -47,7 +47,7 @@ func NewImmichClient(baseURL, apiKey string) *ImmichClient {
 	return &ImmichClient{
 		BaseURL: cleanURL,
 		APIKey:  apiKey,
-		Client:  &http.Client{Timeout: 300 * time.Second}, // Тайм-аут побольше
+		Client:  &http.Client{Timeout: 300 * time.Second},
 	}
 }
 
@@ -201,7 +201,6 @@ func (ic *ImmichClient) AddAssetToAlbum(albumID string, assetID string) error {
 
 	url := fmt.Sprintf("%s/api/albums/%s/assets", ic.BaseURL, albumID)
 
-	// Тело запроса: { "ids": ["uuid-asset-id"] }
 	payload := map[string][]string{
 		"ids": {assetID},
 	}
