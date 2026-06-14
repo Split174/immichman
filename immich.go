@@ -27,7 +27,7 @@ type CreateAlbumResponse struct {
 	ID string `json:"id"`
 }
 
-// Ответ при загрузке
+// Upload response
 type UploadResponse struct {
 	ID        string `json:"id"`
 	Duplicate bool   `json:"duplicate"`
@@ -62,7 +62,7 @@ func (ic *ImmichClient) Ping() error {
 
 	resp, err := ic.Client.Do(req)
 	if err != nil {
-		return fmt.Errorf("ошибка сети: %w", err)
+		return fmt.Errorf("network error: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -73,7 +73,7 @@ func (ic *ImmichClient) Ping() error {
 
 	var user UserResponse
 	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
-		return nil // Успех, но не распарсили JSON (не критично)
+		return nil // Success, but failed to parse JSON (non-critical)
 	}
 	log.Printf("Immich Connection OK. User: %s", user.Email)
 	return nil
@@ -82,7 +82,7 @@ func (ic *ImmichClient) Ping() error {
 func (ic *ImmichClient) GetOrCreateAlbum(albumName string) (string, error) {
 	targetURL := fmt.Sprintf("%s/api/albums", ic.BaseURL)
 
-	// 1. Получаем список
+	// 1. Fetch the list
 	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		return "", err
@@ -107,8 +107,8 @@ func (ic *ImmichClient) GetOrCreateAlbum(albumName string) (string, error) {
 		}
 	}
 
-	// 2. Создаем
-	log.Printf("Создаем альбом '%s'...", albumName)
+	// 2. Create
+	log.Printf("Creating album '%s'...", albumName)
 	createBody := map[string]string{"albumName": albumName}
 	jsonBody, _ := json.Marshal(createBody)
 
@@ -128,7 +128,7 @@ func (ic *ImmichClient) GetOrCreateAlbum(albumName string) (string, error) {
 
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("ошибка создания альбома: %s", string(body))
+		return "", fmt.Errorf("album creation error: %s", string(body))
 	}
 
 	var newAlbum CreateAlbumResponse
@@ -138,7 +138,7 @@ func (ic *ImmichClient) GetOrCreateAlbum(albumName string) (string, error) {
 	return newAlbum.ID, nil
 }
 
-// UploadAsset просто загружает файл
+// UploadAsset simply uploads a file
 func (ic *ImmichClient) UploadAsset(fileName string, fileReader io.Reader, createdAt time.Time, deviceAssetID string) (*UploadResponse, error) {
 	uploadURL := fmt.Sprintf("%s/api/assets", ic.BaseURL)
 
@@ -186,17 +186,17 @@ func (ic *ImmichClient) UploadAsset(fileName string, fileReader io.Reader, creat
 
 	var uploadResp UploadResponse
 	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
-		// Если JSON не пришел, но статус ОК - создаем фальшивый ID (возможно дубликат без тела)
+		// If JSON didn't arrive but status is OK - create a fake ID (possibly a duplicate without body)
 		return &UploadResponse{Duplicate: true, ID: ""}, nil
 	}
 
 	return &uploadResp, nil
 }
 
-// AddAssetToAlbum привязывает загруженный файл к альбому (PUT /api/albums/:id/assets)
+// AddAssetToAlbum links an uploaded file to an album (PUT /api/albums/:id/assets)
 func (ic *ImmichClient) AddAssetToAlbum(albumID string, assetID string) error {
 	if assetID == "" {
-		return fmt.Errorf("получен пустой assetID, невозможно добавить в альбом")
+		return fmt.Errorf("received empty assetID, cannot add to album")
 	}
 
 	url := fmt.Sprintf("%s/api/albums/%s/assets", ic.BaseURL, albumID)
@@ -223,9 +223,9 @@ func (ic *ImmichClient) AddAssetToAlbum(albumID string, assetID string) error {
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("ошибка добавления в альбом (код %d): %s", resp.StatusCode, string(body))
+		return fmt.Errorf("add to album error (code %d): %s", resp.StatusCode, string(body))
 	}
 
-	log.Printf("Успешно добавлено в альбом %s (Asset: %s)", albumID, assetID)
+	log.Printf("Successfully added to album %s (Asset: %s)", albumID, assetID)
 	return nil
 }

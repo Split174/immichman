@@ -73,8 +73,8 @@ docker-compose up -d
     *   Send a photo or video.
     *   The bot will upload it to an Immich album named after the chat (e.g., *"Family Group"*).
 3.  **Specify a Custom Album:**
-    *   Add a caption to your media containing the trigger word `!папка` (Russian for "!folder") followed by the album name.
-    *   Example caption: `Look at this view! !папка Trip 2024`
+    *   Add a caption to your media containing the trigger word `!folder` (Russian for "!folder") followed by the album name.
+    *   Example caption: `Look at this view! !folder Trip 2024`
     *   The bot will upload the file(s) to the **"Trip 2024"** album in Immich (creating it if it doesn't exist).
 
 ## 🔒 Security & Privacy

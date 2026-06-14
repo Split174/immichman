@@ -15,7 +15,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// --- КОНФИГ ОЧЕРЕДИ ---
+// --- QUEUE CONFIG ---
 
 const (
 	maxAttempts = 5
@@ -25,10 +25,10 @@ const (
 
 var bucketName = []byte("jobs")
 
-// --- ЗАДАЧА ---
+// --- JOB ---
 
 type UploadJob struct {
-	Key        string    `json:"key"` // = deviceAssetID, уникальный ключ задачи
+	Key        string    `json:"key"` // = deviceAssetID, unique job key
 	FileID     string    `json:"file_id"`
 	CustomName string    `json:"custom_name"`
 	AlbumName  string    `json:"album_name"`
@@ -38,9 +38,9 @@ type UploadJob struct {
 	Attempts   int       `json:"attempts"`
 }
 
-// --- ОШИБКИ ---
+// --- ERRORS ---
 
-// permanentError оборачивает ошибки, которые не нужно ретраить
+// permanentError wraps errors that shouldn't be retried
 type permanentError struct{ err error }
 
 func (e permanentError) Error() string { return e.err.Error() }
@@ -51,7 +51,7 @@ func isPermanent(err error) bool {
 	return ok
 }
 
-// --- ОЧЕРЕДЬ ---
+// --- QUEUE ---
 
 type UploadQueue struct {
 	jobs chan UploadJob
@@ -65,7 +65,7 @@ var uploadQueue *UploadQueue
 func NewUploadQueue(b *gotgbot.Bot, dbPath string) (*UploadQueue, error) {
 	db, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 5 * time.Second})
 	if err != nil {
-		return nil, fmt.Errorf("не удалось открыть БД очереди: %w", err)
+		return nil, fmt.Errorf("failed to open queue DB: %w", err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
 		_, e := tx.CreateBucketIfNotExists(bucketName)
@@ -88,16 +88,16 @@ func (q *UploadQueue) Start() {
 		go q.worker(i)
 	}
 
-	// Восстановление незавершённых задач после перезапуска
+	// Restore unfinished jobs after restart
 	q.restore()
 
-	// Периодический лог размера очереди
+	// Periodic queue size log
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
 			if l := len(q.jobs); l > 0 {
-				log.Printf("Очередь: %d задач в ожидании", l)
+				log.Printf("Queue: %d jobs pending", l)
 			}
 		}
 	}()
@@ -109,23 +109,23 @@ func (q *UploadQueue) Close() {
 	}
 }
 
-// Enqueue сохраняет задачу в БД и кладёт в канал
+// Enqueue saves the job to DB and puts it in the channel
 func (q *UploadQueue) Enqueue(job UploadJob) {
 	if err := q.save(job); err != nil {
-		log.Printf("ВНИМАНИЕ: не удалось сохранить задачу %s в БД: %v", job.Key, err)
+		log.Printf("WARNING: failed to save job %s to DB: %v", job.Key, err)
 	}
 
 	select {
 	case q.jobs <- job:
 	default:
-		// Канал переполнен — кладём блокирующе в отдельной горутине,
-		// чтобы не тормозить обработчик апдейтов Telegram
-		log.Printf("ВНИМАНИЕ: канал очереди переполнен, задача %s ждёт места", job.Key)
+		// Channel is full — put it blocking in a separate goroutine,
+		// so as not to slow down the Telegram update handler
+		log.Printf("WARNING: queue channel is full, job %s is waiting for space", job.Key)
 		go func(j UploadJob) { q.jobs <- j }(job)
 	}
 }
 
-// --- РАБОТА С БД ---
+// --- DB OPERATIONS ---
 
 func (q *UploadQueue) save(job UploadJob) error {
 	data, err := json.Marshal(job)
@@ -142,7 +142,7 @@ func (q *UploadQueue) delete(key string) {
 		return tx.Bucket(bucketName).Delete([]byte(key))
 	})
 	if err != nil {
-		log.Printf("ВНИМАНИЕ: не удалось удалить задачу %s из БД: %v", key, err)
+		log.Printf("WARNING: failed to delete job %s from DB: %v", key, err)
 	}
 }
 
@@ -158,12 +158,12 @@ func (q *UploadQueue) restore() {
 		})
 	})
 	if err != nil {
-		log.Printf("ВНИМАНИЕ: не удалось восстановить задачи из БД: %v", err)
+		log.Printf("WARNING: failed to restore jobs from DB: %v", err)
 		return
 	}
 
 	if len(jobs) > 0 {
-		log.Printf("Восстановлено %d незавершённых задач из БД", len(jobs))
+		log.Printf("Restored %d unfinished jobs from DB", len(jobs))
 	}
 
 	for _, j := range jobs {
@@ -171,7 +171,7 @@ func (q *UploadQueue) restore() {
 	}
 }
 
-// --- ВОРКЕРЫ ---
+// --- WORKERS ---
 
 func (q *UploadQueue) worker(id int) {
 	defer q.wg.Done()
@@ -183,12 +183,12 @@ func (q *UploadQueue) worker(id int) {
 func (q *UploadQueue) process(job UploadJob) {
 	err := q.processUpload(job)
 	if err == nil {
-		q.delete(job.Key) // успех — убираем из БД
+		q.delete(job.Key) // success — remove from DB
 		return
 	}
 
 	if isPermanent(err) {
-		log.Printf("ОТКАЗ (permanent): задача %s: %v", job.Key, err)
+		log.Printf("REJECTED (permanent): job %s: %v", job.Key, err)
 		q.markFailed(job)
 		q.delete(job.Key)
 		return
@@ -196,32 +196,32 @@ func (q *UploadQueue) process(job UploadJob) {
 
 	job.Attempts++
 	if job.Attempts >= maxAttempts {
-		log.Printf("ОТКАЗ: задача %s провалена после %d попыток: %v", job.Key, job.Attempts, err)
+		log.Printf("REJECTED: job %s failed after %d attempts: %v", job.Key, job.Attempts, err)
 		q.markFailed(job)
 		q.delete(job.Key)
 		return
 	}
 
 	delay := backoffWithJitter(job.Attempts)
-	log.Printf("Повтор задачи %s (попытка %d) через %s. Причина: %v",
+	log.Printf("Retrying job %s (attempt %d) in %s. Reason: %v",
 		job.Key, job.Attempts, delay.Round(time.Second), err)
 
-	// Обновляем счётчик попыток в БД на случай краша во время ожидания
+	// Update attempt counter in DB in case of a crash during the wait
 	if err := q.save(job); err != nil {
-		log.Printf("ВНИМАНИЕ: не удалось обновить задачу %s в БД: %v", job.Key, err)
+		log.Printf("WARNING: failed to update job %s in DB: %v", job.Key, err)
 	}
 
-	// Ретрай в отдельной горутине, чтобы не блокировать воркер
+	// Retry in a separate goroutine so as not to block the worker
 	go func(j UploadJob, d time.Duration) {
 		time.Sleep(d)
 		q.jobs <- j
 	}(job, delay)
 }
 
-// backoffWithJitter: 5s, 15s, 45s, 135s... ±20% случайного джиттера
+// backoffWithJitter: 5s, 15s, 45s, 135s... ±20% random jitter
 func backoffWithJitter(attempt int) time.Duration {
 	base := 5 * time.Second * time.Duration(pow(3, attempt-1))
-	jitter := time.Duration(rand.Int63n(int64(base) / 5)) // до 20%
+	jitter := time.Duration(rand.Int63n(int64(base) / 5)) // up to 20%
 	if rand.Intn(2) == 0 {
 		return base - jitter
 	}
@@ -247,22 +247,22 @@ func (q *UploadQueue) setReaction(job UploadJob, emoji string) {
 	})
 }
 
-// --- ЛОГИКА ЗАГРУЗКИ ---
+// --- UPLOAD LOGIC ---
 
 func (q *UploadQueue) processUpload(job UploadJob) error {
-	log.Printf("Обработка: %s (Альбом: %s, попытка %d)", job.FileID, job.AlbumName, job.Attempts+1)
+	log.Printf("Processing: %s (Album: %s, attempt %d)", job.FileID, job.AlbumName, job.Attempts+1)
 
 	albumID, err := immichClient.GetOrCreateAlbum(job.AlbumName)
 	if err != nil {
-		log.Printf("ОШИБКА с альбомом: %v", err)
-		return err // сетевая/immich ошибка — ретраим
+		log.Printf("ERROR with album: %v", err)
+		return err // network/immich error — retry
 	}
 
 	tgFile, err := q.bot.GetFile(job.FileID, &gotgbot.GetFileOpts{
 		RequestOpts: &gotgbot.RequestOpts{Timeout: 15 * time.Second},
 	})
 	if err != nil {
-		log.Printf("ОШИБКА GetFile у TG: %v", err)
+		log.Printf("ERROR GetFile from TG: %v", err)
 		return err
 	}
 
@@ -272,17 +272,17 @@ func (q *UploadQueue) processUpload(job UploadJob) error {
 
 	resp, err := tgClient.Get(dlURL)
 	if err != nil {
-		log.Printf("ОШИБКА загрузки файла из TG: %v", err)
-		return err // сеть — ретраим
+		log.Printf("ERROR downloading file from TG: %v", err)
+		return err // network — retry
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		// 4xx — скорее всего файл устарел/недоступен, ретрай бесполезен
+		// 4xx — the file is likely expired/unavailable, retry is useless
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			return permanent(fmt.Errorf("ошибка скачивания TG (permanent): %s", resp.Status))
+			return permanent(fmt.Errorf("TG download error (permanent): %s", resp.Status))
 		}
-		return fmt.Errorf("ошибка скачивания TG: %s", resp.Status)
+		return fmt.Errorf("TG download error: %s", resp.Status)
 	}
 
 	finalName := job.CustomName
@@ -292,28 +292,28 @@ func (q *UploadQueue) processUpload(job UploadJob) error {
 
 	uploadResult, err := immichClient.UploadAsset(finalName, resp.Body, job.FileDate, job.Key)
 	if err != nil {
-		log.Printf("ОШИБКА UploadAsset (файл %s): %v", finalName, err)
+		log.Printf("ERROR UploadAsset (file %s): %v", finalName, err)
 		return err
 	}
 
 	if uploadResult.ID == "" {
 		if uploadResult.Duplicate {
-			log.Printf("Файл '%s' уже существует (дубликат).", finalName)
+			log.Printf("File '%s' already exists (duplicate).", finalName)
 			q.setReaction(job, "👀")
 			return nil
 		}
-		return permanent(fmt.Errorf("файл загружен, но ID не получен"))
+		return permanent(fmt.Errorf("file uploaded but no ID received"))
 	}
 
 	if err := immichClient.AddAssetToAlbum(albumID, uploadResult.ID); err != nil {
-		// Файл уже залит. Если ретраить целиком — Immich отбросит дубликат
-		// по deviceAssetID, но в альбом так и не попадёт. Поэтому ретраим
-		// только добавление в альбом.
-		log.Printf("Загружен, но не добавлен в альбом: %v", err)
-		return fmt.Errorf("ошибка добавления в альбом: %w", err)
+		// File is already uploaded. If we retry the whole thing — Immich will discard
+		// the duplicate by deviceAssetID, but it still won't be in the album. So we retry
+		// only the album addition.
+		log.Printf("Uploaded but not added to album: %v", err)
+		return fmt.Errorf("add to album error: %w", err)
 	}
 
 	q.setReaction(job, "👌")
-	log.Printf("ОК: %s -> Альбом %s", finalName, job.AlbumName)
+	log.Printf("OK: %s -> Album %s", finalName, job.AlbumName)
 	return nil
 }
