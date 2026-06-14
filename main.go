@@ -122,6 +122,14 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Инициализация очереди загрузок с персистентностью
+	uploadQueue, err = NewUploadQueue(b, "queue.db")
+	if err != nil {
+		log.Fatalf("Не удалось инициализировать очередь: %v", err)
+	}
+	defer uploadQueue.Close()
+	uploadQueue.Start()
+
 	dispatcher := ext.NewDispatcher(&ext.DispatcherOpts{
 		Error: func(b *gotgbot.Bot, ctx *ext.Context, err error) ext.DispatcherAction {
 			log.Println("Ошибка обработчика:", err)
@@ -172,24 +180,21 @@ func loadAdmins(env string) {
 	}
 }
 
-// handleMedia разбирает сообщение и запускает выгрузку в Immich
+// handleMedia разбирает сообщение и ставит файл в очередь на выгрузку
 func handleMedia(b *gotgbot.Bot, ctx *ext.Context) error {
 	msg := ctx.EffectiveMessage
 	chat := ctx.EffectiveChat
 	user := ctx.EffectiveSender.User
 
-	// --- 1. ПРОВЕРКА ПРАВ ДОСТУПА ---
 	if !checkPermission(b, chat, user) {
 		return nil
 	}
-	// --------------------------------
 
 	var fileID, fileName string
-	var fileDate = time.Unix(msg.Date, 0)
+	fileDate := time.Unix(msg.Date, 0)
 
 	if len(msg.Photo) > 0 {
-		best := msg.Photo[len(msg.Photo)-1]
-		fileID = best.FileId
+		fileID = msg.Photo[len(msg.Photo)-1].FileId
 	} else if msg.Video != nil {
 		fileID = msg.Video.FileId
 		fileName = msg.Video.FileName
@@ -204,10 +209,21 @@ func handleMedia(b *gotgbot.Bot, ctx *ext.Context) error {
 		return nil
 	}
 
-	// Определяем имя альбома, в который будем загружать
+	// Имя альбома определяем здесь (до очереди), т.к. кэш медиагрупп
+	// живёт всего 2 минуты и протухнет, пока задача ждёт ретрая.
 	albumName := resolveTargetAlbumName(ctx, msg.MediaGroupId, msg.Caption)
 
-	return uploadToImmich(b, ctx, fileID, fileName, albumName, fileDate)
+	uploadQueue.Enqueue(UploadJob{
+		Key:        fmt.Sprintf("tg-%d-%d", chat.Id, msg.MessageId),
+		FileID:     fileID,
+		CustomName: fileName,
+		AlbumName:  albumName,
+		FileDate:   fileDate,
+		ChatID:     chat.Id,
+		MessageID:  msg.MessageId,
+	})
+
+	return nil
 }
 
 // checkPermission решает, обрабатывать ли файлы из этого чата
